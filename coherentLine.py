@@ -18,7 +18,6 @@ from scipy.spatial.distance import cdist
 from sklearn.cluster import DBSCAN, KMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn import metrics
-import distance_metric
 import networkx as nx
 
 # get normalized gradient from sobel filter
@@ -244,12 +243,16 @@ def createGraph(ID,N,etf):
     return G
 
 def distance(i,j,ID,etf):
-    x1 = ID[i,:]
-    x2 = ID[j,:]
+    x1 = ID[i,:].astype(float)
+    x2 = ID[j,:].astype(float)
     t1 = etf[x1[0],x1[1],:]
     t2 = etf[x2[0],x2[1],:]
-    d = 1.0-np.abs(np.dot(t1,t2))
-    return d
+    dx = (x1-x2)/np.linalg.norm(x1-x2)
+    dx = dx[::-1] # the coordinate definition for ID (image) and etf are opposite
+    d1 = np.array([1.0 - np.abs(np.dot(t1,t2)), 1.0 - np.abs(np.dot(dx,t1)), 1.0 - np.abs(np.dot(dx,t2))])
+    d1[d1<0.1] = 0
+    d1[d1>0.5] = 10
+    return sum(d1)
 
 def distance_all(X):
     n = X.shape[0]
@@ -292,7 +295,7 @@ def calConnectivity(G,N):
     return connect_list, C
 
 # find tip and fork points
-def findTipPoints(ID, connected_group,row_,col_):
+def findTipPoints(ID, connected_group, row_, col_):
     tip_img = np.ones((row_,col_)) # create temp white image
     tip_points = []
     fork_points = []
@@ -300,7 +303,7 @@ def findTipPoints(ID, connected_group,row_,col_):
     # plt.subplot(1,3,2)
     # ax2 = plt.gca()
     for group in connected_group:
-        if group.__len__() >= 3:
+        if group.__len__() >= 3: # ignore small groups
             xy = ID[group,:]
             temp_img = np.ones((row_,col_)) # create temp white image
             temp_img[xy[:,0],xy[:,1]] = 0 # set subgraph as a black pattern
@@ -413,6 +416,142 @@ def connectPoints(tip_points,fork_points,connectivity_list,C,G,ID):
         #         for cp in center_points:
 
 
+def fitBspline(ID, connected_group, G, etf, row_, col_):
+    point_cluster = []
+    bspline_set = []
+    for group in connected_group:
+        if group.__len__() >= 3: # ignore small groups
+            subG = nx.subgraph(G,group)
+            while group.__len__() > 3: # Check if group is non-empty after strokes taken away
+                point_cluster.append([])
+
+                ## find the tip points
+                xy = ID[group,:]
+                temp_img = np.ones((row_,col_)) # create temp white image
+                temp_img[xy[:,0],xy[:,1]] = 0 # set subgraph as a black pattern
+                fig1 = plt.figure()
+                ax1 = fig1.add_subplot(111)
+                ax1.imshow(temp_img)
+                plt.show()
+
+                s = np.zeros((xy.shape[0],)) # initialize score
+                dd = int(np.round((1-sum(sum(temp_img))/float(temp_img.size))*min(row_,col_))/2)
+                for trial, d in enumerate([dd-1,dd,dd+1]):
+                    for id, coord in enumerate(xy):
+                        for r_ in np.arange(-d,d+1):
+                            for c_ in np.arange(-d,d+1):
+                                if r_!=0 or c_!=0:
+                                    if coord[0]+r_>=0 and coord[0]+r_<row_ and coord[1]+c_>=0 and coord[1]+c_<col_:
+                                        s[id] -= temp_img[coord[0]+r_,coord[1]+c_] # more white areas means closer to tip
+                                    else:
+                                        s[id] -= 1
+                        if trial==0 and s[id]<-(2*d+1)**2+1: # if isolated point, remove
+                            subG.remove_node(group[id])
+                            group.remove(group[id])
+
+                # temp_img[xy[:,0],xy[:,1]] = s
+                # tip_img += temp_img
+
+                s -= np.min(s) # set s to be non-negative
+                s /= (np.max(s)+0.0000001) # set s to [0,1]
+
+                ## cluster s to get the tips and fork points
+                db = KMeans(n_clusters=3).fit(s[np.newaxis].T)
+                labels = db.labels_
+                u_labels = set(labels)
+                sum_s = np.zeros((3,))
+                for id, l in enumerate(u_labels):
+                    sum_s[id] = np.average(s[labels==l])
+                # potential_fork = np.array(group)[labels==list(u_labels)[np.where(sum_s==np.max(sum_s))[0][0]]]
+                potential_tip = np.array(group)[labels==list(u_labels)[np.where(sum_s==np.min(sum_s))[0][0]]]
+                # s_fork = s[labels==list(u_labels)[np.where(sum_s==np.max(sum_s))[0][0]]]
+                s_tip = s[labels==list(u_labels)[np.where(sum_s==np.min(sum_s))[0][0]]]
+
+                db = DBSCAN(eps=1.0, min_samples=3).fit(ID[potential_tip,:])
+                labels = db.labels_
+                picked_tip = []
+                for l in set(labels):
+                    if l>=0:
+                        current_id = np.where(labels==l)[0]
+                        picked_id = current_id[np.where(s_tip[current_id]==np.min(s_tip[current_id]))[0][0]]
+                        picked_tip.append(potential_tip[picked_id])
+
+                ## calculate distance between each pair of tip points and find the shortest distance
+                key_points = np.array(picked_tip)
+                N = key_points.shape[0]
+                d = 1000000
+                path = []
+                for i in np.arange(N):
+                    for j in np.arange(i+1,N):
+                        try:
+                            path_length = nx.dijkstra_path_length(subG,key_points[i],key_points[j])
+                            if path_length<d:
+                                d = path_length
+                                path = nx.dijkstra_path(subG,key_points[i],key_points[j]) # get the shortest path from the image graph
+                        except:
+                            print "Oops!"
+
+                ## remove all nodes close to the path
+                for n in path:
+                    if n in subG.nodes():
+                        subG.remove_node(n)
+                        group.remove(n)
+                        point_cluster[-1].append(n)
+                        r, c = ID[n,:].astype(int)
+                        cos_theta = etf[r,c,1]
+                        sin_theta = -etf[r,c,0]
+                        # scan in one direction
+                        k = 1
+                        more = True
+                        while more:
+                            more = False
+                            r_offset = int(np.round(sin_theta*k))
+                            c_offset = int(np.round(cos_theta*k))
+
+                            n1 = np.logical_and(ID[:,0]==r+r_offset,ID[:,1]==c+c_offset).nonzero()[0]
+                            if n1.size>0: # if point is black, i.e., in the ID set
+                                n1 = n1[0]
+                                if n1 in group: # if in the current group
+                                    t_n1 = etf[r+r_offset,c+c_offset,:]
+                                    t = etf[r,c,:]
+                                    if np.abs(np.dot(t_n1,t))>0.8: # if two tangent are aligned
+                                        subG.remove_node(n1)
+                                        group.remove(n1)
+                                        point_cluster[-1].append(n1)
+                                        more = True
+                                        k += 1
+
+                        # scan in the other direction
+                        k = 1
+                        more = True
+                        while more:
+                            more = False
+                            r_offset = int(np.round(sin_theta*k))
+                            c_offset = int(np.round(cos_theta*k))
+
+                            n1 = np.logical_and(ID[:,0]==r-r_offset,ID[:,1]==c-c_offset).nonzero()[0]
+                            if n1.size>0: # if point is black, i.e., in the ID set
+                                n1 = n1[0]
+                                if n1 in group: # if in the current group
+                                    t_n1 = etf[r-r_offset,c-c_offset,:]
+                                    t = etf[r,c,:]
+                                    if np.abs(np.dot(t_n1,t))>0.8: # if two tangent are aligned
+                                        subG.remove_node(n1)
+                                        group.remove(n1)
+                                        point_cluster[-1].append(n1)
+                                        more = True
+                                        k += 1
+                if point_cluster[-1].__len__()>3:
+                    try:
+                        c,u0,X = fit_bspline(ID[point_cluster[-1],1], ID[point_cluster[-1],0], num_control_points=int(min(max(3,point_cluster[-1].__len__()/10.0),10)))
+                        bspline_set.append([c,u0,X])
+                    except:
+                        what = 1
+
+    return bspline_set
+
+
+
 
 
 # convert point clusters to bsplines
@@ -453,18 +592,20 @@ def getParameter(ID,tree_set):
 #################################### main code ########################################################
 #######################################################################################################
 address = 'raw_image/'
-filename = 'pixar1.jpg'
+filename = 'grayscale_image1.jpg'
 img = cv2.imread(address + filename)
 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-gray = cv2.resize(gray, None, fx=1.0, fy=1.0, )
+gray = cv2.resize(gray, None, fx=0.5, fy=0.5, )
 row_, col_ = gray.shape
 plt.subplot(1,5,1)
 plt.imshow(gray,'gray')
 
+debug = True
 ############################## The following section preprocess the image ##############################
 fdog_img_address = 'fdog_test_data.out'
 etf_address = 'etf_test_data.out'
-if os.path.isfile(fdog_img_address+'.npy') and os.path.isfile(etf_address+'.npy'):
+
+if os.path.isfile(fdog_img_address+'.npy') and os.path.isfile(etf_address+'.npy') and not debug:
     fdog_img = np.load(fdog_img_address+'.npy')
     tan_ETF = np.load(etf_address+'.npy')
 else:
@@ -475,18 +616,19 @@ else:
     tan_ETF = edge_tangent_flow(gray_)
 
     ## FDoG loop
-    fdog_loop = 1
+    fdog_loop = 3
     for count in np.arange(fdog_loop):
         ## Get FDoG Edge
         sigma_e = 1.0
-        sigma_r = 1.6
-        sigma_m = 3.0
-        tau = 0.99
-        phi = 2.0
-        threshold = 0.2
+        sigma_r = 1.6 #1.6
+        sigma_m = 3.0 #3.0
+        tau = 0.99 #0.99
+        phi = 2.0 #2.0
+        threshold = 1.5 #0.2
         fdog_img, f0, f1 = FDoGedge.getFDoGedge(tan_ETF.astype(np.float64),gray_.astype(np.float64),
                                         sigma_e,sigma_r,sigma_m,tau,phi,threshold)
         gray_[fdog_img<255]=0.0
+        # tan_ETF = edge_tangent_flow(gray_)
     np.save(fdog_img_address, fdog_img)
     np.save(etf_address, tan_ETF)
 
@@ -496,46 +638,59 @@ plt.imshow(lic_img,'gray')
 plt.subplot(1,5,3)
 plt.imshow(fdog_img,'gray')
 
-############################## The following section pa
-# rameterizes the image ##############################
-ID = np.array(np.where(fdog_img==0)).T #all pixel indices
-
-file_address = 'processed_data/' + filename + '.pickle'
-if os.path.isfile(file_address):
-    with open(file_address) as f:
-        tree_set, tip_points, fork_points, G, connectivity_list, C, ID = pickle.load(f)
-    f.close()
-
-    plt.subplot(1,5,4)
-    ax3 = plt.gca()
-    for id in np.arange(tip_points.__len__()):
-        picked_tip = np.array(tip_points[id])
-        picked_fork = np.array(fork_points[id])
-        ax3.plot(ID[picked_tip,1], ID[picked_tip,0], 'o', markerfacecolor='r',
-                 markeredgecolor='k', markersize=14)
-        ax3.plot(ID[picked_fork,1], ID[picked_fork,0], 'o', markerfacecolor='g',
-                 markeredgecolor='k', markersize=14)
-    ax3.invert_yaxis()
-    plt.imshow(fdog_img,'gray')
-
-else:
-    ## Step 2: Create image graph
-    G = createGraph(ID,ID.shape[0],tan_ETF)
-    connectivity_list, C = calConnectivity(G,ID.shape[0])
-
-    ## Step 3: Find key points ===THIS PART NEEDS IMPROVEMENT===
-    tip_points, fork_points = findTipPoints(ID,connectivity_list,row_,col_)
-
-    ## Step 4: Create minimum spanning tree of a metagraph from key points
-    tree_set = connectPoints(tip_points,fork_points,connectivity_list,C,G,ID)
-
-    ## Store everything
-    with open(file_address, 'w') as f:
-        pickle.dump([tree_set, tip_points, fork_points, G, connectivity_list, C, ID], f)
-    f.close()
-
-## Step 5: Convert the minimum spanning tree to bsplines
-par_set = getParameter(ID,tree_set)
+# ############################## The following section parameterizes the image ##############################
+# ID = np.array(np.where(fdog_img==0)).T #all pixel indices
+#
+# file_address = 'processed_data/' + filename + '.pickle'
+# if os.path.isfile(file_address):
+#     with open(file_address) as f:
+#         tree_set, tip_points, fork_points, G, connectivity_list, C, ID = pickle.load(f)
+#     f.close()
+#
+#     plt.subplot(1,5,4)
+#     ax3 = plt.gca()
+#     for id in np.arange(tip_points.__len__()):
+#         picked_tip = np.array(tip_points[id])
+#         picked_fork = np.array(fork_points[id])
+#         ax3.plot(ID[picked_tip,1], ID[picked_tip,0], 'o', markerfacecolor='r',
+#                  markeredgecolor='k', markersize=14)
+#         ax3.plot(ID[picked_fork,1], ID[picked_fork,0], 'o', markerfacecolor='g',
+#                  markeredgecolor='k', markersize=14)
+#     ax3.invert_yaxis()
+#     plt.imshow(fdog_img,'gray')
+#
+# else:
+#     ## Step 2: Create image graph
+#     G = createGraph(ID,ID.shape[0],tan_ETF)
+#     connectivity_list, C = calConnectivity(G,ID.shape[0])
+#
+#     # ## Step 3: Find key points ===THIS PART NEEDS IMPROVEMENT===
+#     # tip_points, fork_points = findTipPoints(ID,connectivity_list,row_,col_)
+#     #
+#     # ## Step 4: Create minimum spanning tree of a metagraph from key points
+#     # tree_set = connectPoints(tip_points,fork_points,connectivity_list,C,G,ID)
+#
+#     par_set = fitBspline(ID, connectivity_list, G, tan_ETF, row_, col_)
+#     # Plot the results
+#     plt.subplot(1,5,5)
+#     ax1 = plt.gca()
+#     for par in par_set:
+#         bspline = par[0]
+#         u0 = par[1]
+#         x_plot = par[2]
+#         ax1.plot( *zip(*bspline.M(u0, x_plot).tolist()),linewidth =2)#, c=u0, cmap="jet", alpha=0.5 )
+#         ax1.plot(*zip(*x_plot), marker="o", alpha=0.3)
+#     # Since images render upside down
+#     ax1.invert_yaxis()
+#     # ax1.set_autoscale_on(False)
+#
+#     ## Store everything
+#     with open(file_address, 'w') as f:
+#         pickle.dump([par_set, G, connectivity_list, C, ID], f)
+#     f.close()
+#
+# ## Step 5: Convert the minimum spanning tree to bsplines
+# par_set = getParameter(ID,tree_set)
 
 
 
